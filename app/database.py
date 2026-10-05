@@ -266,6 +266,93 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
+
+CREATE TABLE IF NOT EXISTS localization_dossiers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    product_id INTEGER NOT NULL REFERENCES health_products(id),
+    target_region TEXT NOT NULL,
+    site_id INTEGER NOT NULL REFERENCES pilot_sites(id),
+    intended_use_local TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'drafting' CHECK(status IN ('drafting','reviewing','published','review_pending','closed')),
+    review_trigger TEXT NOT NULL DEFAULT '',
+    current_version_id INTEGER,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_loc_dossier_status ON localization_dossiers(status,id);
+CREATE TABLE IF NOT EXISTS localization_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_id INTEGER NOT NULL REFERENCES localization_dossiers(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('in_review','rejected','published')),
+    current_stage TEXT NOT NULL CHECK(current_stage IN ('medical','compliance','operations','done')),
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    submitted_by TEXT NOT NULL,
+    submitted_at TEXT NOT NULL,
+    published_at TEXT,
+    UNIQUE(dossier_id, version_no)
+);
+CREATE TABLE IF NOT EXISTS localization_version_evidence (
+    version_id INTEGER NOT NULL REFERENCES localization_versions(id) ON DELETE CASCADE,
+    evidence_id INTEGER NOT NULL REFERENCES evidence_documents(id),
+    evidence_version TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL,
+    evidence_status TEXT NOT NULL,
+    PRIMARY KEY(version_id, evidence_id)
+);
+CREATE TABLE IF NOT EXISTS localization_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL REFERENCES localization_versions(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK(stage IN ('medical','compliance','operations')),
+    decision TEXT NOT NULL CHECK(decision IN ('approved','rejected')),
+    reviewer TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    difference_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_loc_reviews ON localization_reviews(version_id,id);
+CREATE TABLE IF NOT EXISTS localization_differences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_id INTEGER NOT NULL REFERENCES localization_dossiers(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    category TEXT NOT NULL CHECK(category IN ('翻译','术语校准','临床场景','合规依据','其他')),
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    evidence_id INTEGER REFERENCES evidence_documents(id),
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','resolved')),
+    opened_by TEXT NOT NULL,
+    opened_in_version_id INTEGER REFERENCES localization_versions(id),
+    resolved_in_version_id INTEGER REFERENCES localization_versions(id),
+    resolution TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(dossier_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_loc_differences ON localization_differences(dossier_id,status,id);
+CREATE TABLE IF NOT EXISTS localization_cooperations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_id INTEGER NOT NULL REFERENCES localization_dossiers(id),
+    reference TEXT NOT NULL UNIQUE,
+    version_id INTEGER NOT NULL REFERENCES localization_versions(id),
+    signed_by TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','withdrawn')),
+    signed_at TEXT NOT NULL,
+    withdrawn_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS localization_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_id INTEGER NOT NULL REFERENCES localization_dossiers(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    actor TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_loc_events ON localization_events(dossier_id,id);
 '''
 
 
@@ -279,6 +366,10 @@ PERMISSIONS = [
     ("catalog.read", "查看健康创新目录", "catalog", "read"),
     ("catalog.write", "维护健康创新目录", "catalog", "write"),
     ("evidence.review", "审阅产品证据", "evidence", "review"),
+    ("localization.read", "查看本地化档案", "localization", "read"),
+    ("localization.write", "维护本地化档案", "localization", "write"),
+    ("localization.review", "审阅本地化版本", "localization", "review"),
+    ("localization.admin", "触发本地化档案复核", "localization", "admin"),
     ("feedback.read", "查看体验反馈", "feedback", "read"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
@@ -334,7 +425,7 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
