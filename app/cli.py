@@ -100,6 +100,88 @@ def pilot_demo() -> int:
     return 0
 
 
+def localization_demo() -> int:
+    with tempfile.TemporaryDirectory(prefix="health-loc-") as directory:
+        os.environ["HEALTH_INNOVATION_DATABASE_PATH"] = os.path.join(directory, "loc.db")
+        close_connection()
+        with TestClient(app) as client:
+            product = client.post("/api/catalog/products", json={
+                "code": "ablation-x",
+                "name": "海外脉冲心脏消融设备",
+                "organization": "海外消融科技",
+                "origin_country": "美国",
+                "category": "康复设备",
+                "intended_use": "用于心律失常患者的导管消融治疗，本地适应人群以本地化版本为准",
+                "risk_level": "high",
+                "regulatory_status": "研究",
+            })
+            hospital = client.post("/api/catalog/sites", json={
+                "code": "hospital-east",
+                "name": "华东心血管医院",
+                "site_type": "医院",
+                "region": "上海",
+                "capabilities": ["cardiac-ablation"],
+                "max_concurrent": 2,
+            })
+            evidence = client.post("/api/catalog/evidence", json={
+                "product_code": "ablation-x",
+                "evidence_type": "临床",
+                "title": "全球多中心临床证据 2025.1",
+                "source_name": "海外多中心注册研究",
+                "source_region": "美国",
+                "version": "2025.1",
+                "content_digest": "0" * 64,
+                "summary": {"patients": 480},
+                "submitted_by": "global-evidence-team",
+            })
+            review = client.post(f"/api/catalog/evidence/{evidence.json()['id']}/review", json={
+                "reviewer": "evidence-reviewer", "decision": "accepted", "note": "来源与统计口径可追溯",
+            })
+            profile = client.post("/api/localization/profiles", json={
+                "code": "loc-ablation-east",
+                "product_code": "ablation-x",
+                "target_region": "上海",
+                "site_code": "hospital-east",
+                "intended_use_local": "适用于华东心血管医院房颤患者的脉冲场消融，围术期流程按本地指南调整",
+                "created_by": "bd-lead",
+            })
+            submitted = client.post("/api/localization/profiles/loc-ablation-east/versions", json={
+                "source_evidence_ids": [evidence.json()["id"]],
+                "differences": [
+                    {"difference_type": "翻译", "topic": "说明书警示语翻译",
+                     "source_text": "Do not reuse catheter", "adjusted_text": "一次性使用，禁止重复灭菌",
+                     "rationale": "按中文警示习惯重写"},
+                    {"difference_type": "术语校准", "topic": "脉冲场消融术语",
+                     "source_text": "PFA", "adjusted_text": "脉冲场消融（PFA）",
+                     "rationale": "与国内指南术语对齐"},
+                    {"difference_type": "临床场景", "topic": "适应人群",
+                     "source_text": "paroxysmal AF", "adjusted_text": "阵发性心房颤动，年龄按本院纳入标准",
+                     "rationale": "本院入排标准更严格"},
+                ],
+                "submitted_by": "localization-editor",
+            })
+            reviews = []
+            for stage in ("medical", "compliance", "operations"):
+                response = client.post("/api/localization/profiles/loc-ablation-east/reviews", json={
+                    "stage": stage, "reviewer": f"{stage}-reviewer", "decision": "approved", "comment": "内容齐备",
+                })
+                reviews.append(response)
+            effective = client.get("/api/localization/profiles/loc-ablation-east/effective-at", params={"at": "2999-01-01"})
+            values = [product, hospital, evidence, review, profile, submitted, *reviews, effective]
+            if any(response.status_code >= 400 for response in values):
+                _print({"errors": [response.text for response in values if response.status_code >= 400]})
+                return 1
+            _print({
+                "profile": profile.json()["code"],
+                "published_version_no": effective.json()["effective_version"]["version_no"],
+                "differences": len(submitted.json()["differences"]),
+                "stages": [record["stage"] for record in reviews[-1].json()["reviews"]],
+                "effective_at_2999": effective.json()["effective_version"]["version_no"],
+            })
+        close_connection()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="全球健康创新试点运营服务命令行")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -107,12 +189,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check-db", help="检查数据库完整性")
     sub.add_parser("smoke", help="进程内检查根路径和健康接口")
     sub.add_parser("pilot-demo", help="运行产品、场地、方案和场次演示")
+    sub.add_parser("localization-demo", help="运行本地化档案三段审阅与时点查询演示")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     command = build_parser().parse_args(argv).command
-    actions = {"init-db": init_database, "check-db": check_database, "smoke": smoke, "pilot-demo": pilot_demo}
+    actions = {"init-db": init_database, "check-db": check_database, "smoke": smoke, "pilot-demo": pilot_demo, "localization-demo": localization_demo}
     try:
         return actions[command]()
     finally:

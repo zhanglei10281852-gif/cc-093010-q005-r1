@@ -12,7 +12,7 @@ def utc_now() -> datetime:
 def to_storage(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
-    return value.astimezone(UTC).isoformat(timespec="seconds")
+    return value.astimezone(UTC).isoformat(timespec="microseconds")
 
 
 def from_storage(value: str | None) -> datetime | None:

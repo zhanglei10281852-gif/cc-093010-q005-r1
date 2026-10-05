@@ -9,6 +9,7 @@ from app.api import audit, auth, departments_admin, maintenance, roles, system, 
 from app.catalog.router import router as catalog_router
 from app.core.errors import DomainError
 from app.database import close_connection, init_db
+from app.localization.router import router as localization_router
 from app.pilots.router import router as pilot_router
 
 
@@ -40,6 +41,7 @@ app.include_router(system.router)
 app.include_router(departments_admin.router)
 app.include_router(maintenance.router)
 app.include_router(catalog_router)
+app.include_router(localization_router)
 app.include_router(pilot_router)
 
 

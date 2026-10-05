@@ -168,6 +168,7 @@ CREATE TABLE IF NOT EXISTS evidence_documents (
     version TEXT NOT NULL,
     content_digest TEXT NOT NULL,
     summary_json TEXT NOT NULL DEFAULT '{}',
+    replaces_evidence_id INTEGER REFERENCES evidence_documents(id),
     status TEXT NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','accepted','rejected','superseded')),
     submitted_by TEXT NOT NULL,
     submitted_at TEXT NOT NULL,
@@ -266,6 +267,95 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
+
+CREATE TABLE IF NOT EXISTS localization_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    product_id INTEGER NOT NULL REFERENCES health_products(id),
+    target_region TEXT NOT NULL,
+    partner_site_id INTEGER NOT NULL REFERENCES pilot_sites(id),
+    intended_use_local TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','in_review','published','under_review','withdrawn')),
+    published_version_no INTEGER,
+    withdrawn_at TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_loc_profiles_status ON localization_profiles(status);
+CREATE TABLE IF NOT EXISTS localization_profile_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL REFERENCES localization_profiles(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL,
+    intended_use_local TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('in_review','approved','returned','superseded')),
+    current_stage TEXT CHECK(current_stage IS NULL OR current_stage IN ('medical','compliance','operations')),
+    submitted_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    published_at TEXT,
+    UNIQUE(profile_id, version_no)
+);
+CREATE TABLE IF NOT EXISTS localization_version_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL REFERENCES localization_profile_versions(id) ON DELETE CASCADE,
+    evidence_id INTEGER NOT NULL REFERENCES evidence_documents(id),
+    note TEXT NOT NULL DEFAULT '',
+    added_at TEXT NOT NULL,
+    UNIQUE(version_id, evidence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_loc_sources_evidence ON localization_version_sources(evidence_id);
+CREATE TABLE IF NOT EXISTS localization_differences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL REFERENCES localization_profile_versions(id) ON DELETE CASCADE,
+    difference_type TEXT NOT NULL CHECK(difference_type IN ('翻译','术语校准','临床场景')),
+    topic TEXT NOT NULL,
+    source_text TEXT NOT NULL DEFAULT '',
+    adjusted_text TEXT NOT NULL DEFAULT '',
+    rationale TEXT NOT NULL DEFAULT '',
+    resolution TEXT NOT NULL DEFAULT 'open' CHECK(resolution IN ('open','addressed','carried')),
+    carried_from_difference_id INTEGER REFERENCES localization_differences(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_loc_differences_version ON localization_differences(version_id);
+CREATE TABLE IF NOT EXISTS localization_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL REFERENCES localization_profile_versions(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK(stage IN ('medical','compliance','operations')),
+    reviewer TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('approved','returned')),
+    comment TEXT NOT NULL DEFAULT '',
+    difference_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_loc_reviews_version ON localization_reviews(version_id,id);
+CREATE TABLE IF NOT EXISTS localization_review_flags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL REFERENCES localization_profiles(id) ON DELETE CASCADE,
+    reason_type TEXT NOT NULL CHECK(reason_type IN ('site_exit','product_suspended','evidence_superseded','manual')),
+    detail TEXT NOT NULL DEFAULT '',
+    evidence_id INTEGER REFERENCES evidence_documents(id),
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','resolved','dismissed')),
+    raised_by TEXT NOT NULL,
+    raised_at TEXT NOT NULL,
+    resolved_by TEXT,
+    resolved_at TEXT,
+    resolution_note TEXT NOT NULL DEFAULT '',
+    new_version_no INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_loc_flags_profile ON localization_review_flags(profile_id,id);
+CREATE TABLE IF NOT EXISTS localization_agreements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL REFERENCES localization_profiles(id),
+    version_id INTEGER NOT NULL REFERENCES localization_profile_versions(id),
+    agreement_code TEXT NOT NULL UNIQUE,
+    signed_by TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    signed_at TEXT NOT NULL,
+    terminated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_loc_agreements_profile ON localization_agreements(profile_id,id);
 '''
 
 
@@ -282,6 +372,11 @@ PERMISSIONS = [
     ("feedback.read", "查看体验反馈", "feedback", "read"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
+    ("localization.read", "查看本地化档案", "localization", "read"),
+    ("localization.write", "维护本地化档案", "localization", "write"),
+    ("localization.review.medical", "医学审阅本地化版本", "localization", "review.medical"),
+    ("localization.review.compliance", "合规审阅本地化版本", "localization", "review.compliance"),
+    ("localization.review.operations", "运营审阅本地化版本", "localization", "review.operations"),
 ]
 
 
@@ -334,7 +429,8 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _apply_column_migrations(connection)
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -342,8 +438,11 @@ def init_db() -> None:
             )
         roles = [
             ("administrator", "系统管理员", "拥有全部系统权限"),
-            ("operator", "试点运营员", "维护目录、场地和体验场次"),
+            ("operator", "试点运营员", "维护目录、场地、本地化档案和体验场次"),
             ("reviewer", "证据审阅员", "审阅产品证据与体验反馈"),
+            ("medical_reviewer", "医学审阅员", "本地化档案医学阶段审阅"),
+            ("compliance_reviewer", "合规审阅员", "本地化档案合规阶段审阅"),
+            ("operations_reviewer", "运营审阅员", "本地化档案运营阶段审阅"),
             ("auditor", "审计查看员", "只读查看运行与审计记录"),
         ]
         for code, name, description in roles:
@@ -356,7 +455,37 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+        role_permission_codes = {
+            "operator": ["catalog.read", "catalog.write", "evidence.review", "feedback.read", "localization.read", "localization.write"],
+            "medical_reviewer": ["localization.read", "localization.review.medical"],
+            "compliance_reviewer": ["localization.read", "localization.review.compliance"],
+            "operations_reviewer": ["localization.read", "localization.review.operations"],
+            "auditor": ["localization.read"],
+        }
+        for role_code, permission_codes in role_permission_codes.items():
+            role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
+            connection.executemany(
+                "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions WHERE code=?",
+                [(role_id, now, code) for code in permission_codes],
+            )
 
 
 def migrate_db() -> None:
     init_db()
+
+
+def _apply_column_migrations(connection: sqlite3.Connection) -> None:
+    """为早期版本创建的旧表补充后加列；SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，需先查列信息。"""
+    additions = {
+        "evidence_documents": [
+            ("replaces_evidence_id", "INTEGER REFERENCES evidence_documents(id)"),
+        ],
+        "localization_profiles": [
+            ("withdrawn_at", "TEXT"),
+        ],
+    }
+    for table, columns in additions.items():
+        existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, declaration in columns:
+            if name not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")

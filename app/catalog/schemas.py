@@ -50,6 +50,7 @@ class EvidenceSubmit(BaseModel):
     version: str = Field(min_length=1, max_length=80)
     content_digest: str = Field(min_length=16, max_length=128)
     summary: dict = Field(default_factory=dict)
+    replaces_evidence_id: int | None = Field(default=None, ge=1)
     submitted_by: str = Field(min_length=1, max_length=120)
 
 

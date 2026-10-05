@@ -6,6 +6,8 @@ from app.catalog.repository import CatalogRepository
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
+from app.localization.repository import LocalizationRepository
+from app.localization.service import raise_change_flags
 
 
 class CatalogService:
@@ -29,8 +31,18 @@ class CatalogService:
         values = {key: value for key, value in changes.items() if value is not None}
         if not values:
             raise ValidationError("没有可更新的产品字段")
+        now = to_storage(self.clock.now())
+        suspension = values.get("regulatory_status") == "暂停" and product["regulatory_status"] != "暂停"
         with transaction(immediate=True) as connection:
-            return CatalogRepository(connection).update_product(product["id"], values, to_storage(self.clock.now()))
+            updated = CatalogRepository(connection).update_product(product["id"], values, now)
+            if suspension:
+                profile_ids = [row["id"] for row in LocalizationRepository(connection).profiles_for_product(product["id"])]
+                raise_change_flags(
+                    connection, reason_type="product_suspended",
+                    detail=f"产品 {code} 的合规状态变更为“暂停”，引用其本地化结论的档案需复核",
+                    raised_by="system", now=now, profile_ids=profile_ids,
+                )
+            return updated
 
     def list_products(self, category: str | None, status: str | None, active_only: bool, limit: int) -> list[dict]:
         return self.repository.list_products(category=category, status=status, active_only=active_only, limit=limit)
@@ -50,8 +62,18 @@ class CatalogService:
         values = {key: value for key, value in changes.items() if value is not None}
         if not values:
             raise ValidationError("没有可更新的场地字段")
+        now = to_storage(self.clock.now())
+        site_exit = values.get("status") == "closed" and site["status"] != "closed"
         with transaction(immediate=True) as connection:
-            return CatalogRepository(connection).update_site(site["id"], values, to_storage(self.clock.now()))
+            updated = CatalogRepository(connection).update_site(site["id"], values, now)
+            if site_exit:
+                profile_ids = [row["id"] for row in LocalizationRepository(connection).profiles_for_site(site["id"])]
+                raise_change_flags(
+                    connection, reason_type="site_exit",
+                    detail=f"合作机构 {code}（{site['name']}）状态变更为“closed”，视为退出合作，相关本地化档案需复核",
+                    raised_by="system", now=now, profile_ids=profile_ids,
+                )
+            return updated
 
     def list_sites(self, status: str | None, site_type: str | None, capability: str | None) -> list[dict]:
         return self.repository.list_sites(status=status, site_type=site_type, capability=capability)
@@ -60,6 +82,13 @@ class CatalogService:
         product = self.repository.product_by_code(data["product_code"])
         if product is None:
             raise NotFoundError("健康创新产品不存在")
+        replaces_id = data.get("replaces_evidence_id")
+        if replaces_id is not None:
+            replaced = self.repository.evidence_by_id(int(replaces_id))
+            if replaced is None:
+                raise NotFoundError("被替代的来源证据不存在")
+            if replaced["product_id"] != product["id"]:
+                raise ValidationError("被替代的来源证据不属于同一产品")
         duplicate = self.repository.evidence_duplicate(product["id"], data["evidence_type"], data["version"], data["content_digest"])
         if duplicate:
             return duplicate
@@ -74,8 +103,22 @@ class CatalogService:
             raise ConflictError("只有待审阅材料可以作出决定")
         if decision == "rejected" and len(note.strip()) < 4:
             raise ValidationError("驳回时需要说明可执行的原因")
+        now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
-            return CatalogRepository(connection).review_evidence(evidence_id, reviewer.strip(), decision, to_storage(self.clock.now()))
+            repository = CatalogRepository(connection)
+            reviewed = repository.review_evidence(evidence_id, reviewer.strip(), decision, now)
+            if decision == "accepted" and evidence["replaces_evidence_id"] is not None:
+                old = repository.evidence_by_id(int(evidence["replaces_evidence_id"]))
+                if old is not None and old["status"] != "superseded":
+                    connection.execute("UPDATE evidence_documents SET status='superseded' WHERE id=?", (old["id"],))
+                    loc_repository = LocalizationRepository(connection)
+                    profile_ids = [row["id"] for row in loc_repository.profiles_referencing_evidence(old["id"])]
+                    raise_change_flags(
+                        connection, reason_type="evidence_superseded",
+                        detail=f"上游证据“{old['title']}”（{old['version']}）已被新证据 {evidence_id} 替代，引用档案需复核",
+                        raised_by="system", now=now, profile_ids=profile_ids, evidence_id=old["id"],
+                    )
+            return reviewed
 
     def list_evidence(self, product_code: str | None, status: str | None) -> list[dict]:
         product_id = None

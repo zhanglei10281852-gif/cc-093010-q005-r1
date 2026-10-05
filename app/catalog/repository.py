@@ -109,8 +109,8 @@ class CatalogRepository:
 
     def create_evidence(self, product_id: int, data: dict, now: str) -> dict:
         cursor = self.connection.execute(
-            "INSERT INTO evidence_documents(product_id,evidence_type,title,source_name,source_region,version,content_digest,summary_json,status,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?, 'submitted',?,?)",
-            (product_id, data["evidence_type"], data["title"], data["source_name"], data["source_region"], data["version"], data["content_digest"], json.dumps(data["summary"], ensure_ascii=False, sort_keys=True), data["submitted_by"], now),
+            "INSERT INTO evidence_documents(product_id,evidence_type,title,source_name,source_region,version,content_digest,summary_json,replaces_evidence_id,status,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?,?, 'submitted',?,?)",
+            (product_id, data["evidence_type"], data["title"], data["source_name"], data["source_region"], data["version"], data["content_digest"], json.dumps(data["summary"], ensure_ascii=False, sort_keys=True), data.get("replaces_evidence_id"), data["submitted_by"], now),
         )
         return self.evidence_by_id(int(cursor.lastrowid)) or {}
 
